@@ -1,10 +1,13 @@
-package gitregostore
+package gitregostoreclone
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -14,6 +17,9 @@ import (
 	"github.com/go-gota/gota/dataframe"
 	opapolicy "github.com/kubescape/opa-utils/reporthandling"
 	"github.com/kubescape/opa-utils/reporthandling/attacktrack/v1alpha1"
+
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"go.uber.org/zap"
 )
 
@@ -89,7 +95,7 @@ func (gs *GitRegoStore) setObjectsFromRepoLoop() error {
 	go func() {
 		f := true
 		for {
-			if err := gs.SetObjectsFromRepoOnce(); err != nil {
+			if err := gs.setObjectsFromRepoOnce(); err != nil {
 				e = err
 			}
 			if f {
@@ -106,90 +112,202 @@ func (gs *GitRegoStore) setObjectsFromRepoLoop() error {
 	return e
 }
 
-func (gs *GitRegoStore) SetObjectsFromRepoOnce() error {
-	body, err := HttpGetter(gs.httpClient, gs.URL)
+func (gs *GitRegoStore) clone() error {
+	if gs.cloneDir != "" {
+		return nil
+	}
+	tmpDir, err := os.MkdirTemp("", "gitregostore-regolibrary")
 	if err != nil {
 		return err
 	}
-	var trees Tree
-	err = json.Unmarshal([]byte(body), &trees)
+	cloneDir := filepath.Join(tmpDir, gs.Repository)
+	cloneOpts := git.CloneOptions{
+		URL:           fmt.Sprintf("https://github.com/%s/%s.git", gs.Owner, gs.Repository),
+		RemoteName:    "origin",
+		ReferenceName: plumbing.NewBranchReferenceName(gs.Branch),
+		SingleBranch:  true,
+		Depth:         1, // get only the latest commits
+	}
+	_, err = git.PlainClone(cloneDir, false, &cloneOpts)
+	if err == nil {
+		gs.cloneDir = cloneDir
+	}
+	return err
+}
+
+// Close cleans up the temporary files if there are
+func (gs *GitRegoStore) Close() {
+	if gs.cloneDir != "" {
+		os.RemoveAll(filepath.Base(gs.cloneDir))
+	}
+}
+
+func (gs *GitRegoStore) syncClone() error {
+	if gs.cloneDir == "" {
+		return gs.clone()
+	}
+	pullOpts := git.PullOptions{
+		RemoteName:    "origin",
+		ReferenceName: plumbing.NewBranchReferenceName(gs.Branch),
+		// SingleBranch:  true,
+		// Depth: 1, // get only the latest commits
+	}
+	r, err := git.PlainOpen(gs.cloneDir)
 	if err != nil {
-		return fmt.Errorf("failed to unmarshal response body from '%s', reason: %s", gs.URL, err.Error())
+		return err
+	}
+	w, err := r.Worktree()
+	if err != nil {
+		return err
+	}
+	err = w.Pull(&pullOpts)
+	return err
+}
+
+func (gs *GitRegoStore) setRulesFromLocalRepo() error {
+	dir := filepath.Join(gs.cloneDir, rulesJsonFileName)
+	rulesDirs, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, rulesDir := range rulesDirs {
+		if !rulesDir.IsDir() {
+			continue
+		}
+		err = gs.setRuleFromLocalRepo(filepath.Join(dir, rulesDir.Name()))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (gs *GitRegoStore) setRuleFromLocalRepo(path string) error {
+	// metadata
+	metadata, err := os.ReadFile(filepath.Join(path, "rule.metadata.json"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	rule := &opapolicy.PolicyRule{}
+	err = JSONDecoder(string(metadata)).Decode(rule)
+	if err != nil {
+		return err
+	}
+
+	// raw
+	raw, err := os.ReadFile(filepath.Join(path, "raw.rego"))
+	if err != nil {
+		return err
+	}
+	rule.Rule = string(raw)
+
+	// filter
+	filter, err := os.ReadFile(filepath.Join(path, "filter.rego"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	rule.ResourceEnumerator = string(filter)
+
+	gs.Rules = append(gs.Rules, *rule)
+	return nil
+}
+
+func (gs *GitRegoStore) setControlsFromLocalRepo() error {
+	dir := filepath.Join(gs.cloneDir, controlsJsonFileName)
+	return gs.setGenericObjectsFromLocalRepo(dir, gs.setControl)
+}
+
+func (gs *GitRegoStore) setFrameworksFromLocalRepo() error {
+	dir := filepath.Join(gs.cloneDir, frameworksJsonFileName)
+	return gs.setGenericObjectsFromLocalRepo(dir, gs.setFramework)
+}
+func (gs *GitRegoStore) setAttackTracksFromLocalRepo() error {
+	dir := filepath.Join(gs.cloneDir, attackTracksPathPrefix)
+	return gs.setGenericObjectsFromLocalRepo(dir, gs.setAttackTrack)
+}
+func (gs *GitRegoStore) setSystemExceptionsFromLocalRepo() error {
+	dir := filepath.Join(gs.cloneDir, systemPostureExceptionFileName)
+	return gs.setGenericObjectsFromLocalRepo(dir, gs.setSystemPostureExceptionPolicy)
+}
+
+func (gs *GitRegoStore) setDefaultConfigInputsFromLocalRepo() error {
+	defaultConfigInputs, err := os.ReadFile(filepath.Join(gs.cloneDir, "default-config-inputs.json"))
+	if err != nil {
+		return err
+	}
+	return gs.setDefaultConfigInputs(string(defaultConfigInputs))
+}
+
+func (gs *GitRegoStore) setControlRuleRelationsFromLocalRepo() error {
+	controlRuleRelations, err := os.ReadFile(filepath.Join(gs.cloneDir, "ControlID_RuleName.csv"))
+	if err != nil {
+		return err
+	}
+	return gs.setControlRuleRelations(string(controlRuleRelations))
+}
+
+func (gs *GitRegoStore) setFrameworkControlRelationsFromRepo() error {
+	controlRuleRelations, err := os.ReadFile(filepath.Join(gs.cloneDir, "FWName_CID_CName.csv"))
+	if err != nil {
+		return err
+	}
+	return gs.setControlRuleRelations(string(controlRuleRelations))
+}
+
+// setGenericObjectsFromLocalRepo set simple json objects from given directory `path` to `gs` using `setFunc`
+func (gs *GitRegoStore) setGenericObjectsFromLocalRepo(path string, setFunc func(string) error) error {
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		path := filepath.Join(path, file.Name())
+		if file.IsDir() || !strings.HasSuffix(path, ".json") {
+			continue
+		}
+		attackTrack, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		err = setFunc(string(attackTrack))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (gs *GitRegoStore) setObjectsFromRepoOnce() error {
+	// clone / pull repo
+	err := gs.syncClone()
+	if err != nil {
+		if errors.Is(err, git.NoErrAlreadyUpToDate) {
+			return nil
+		}
+		return err
 	}
 
 	//use a clone of the store for the update to avoid long lock time
 	gsClone := newGitRegoStore(gs.BaseUrl, gs.Owner, gs.Repository, gs.Path, gs.Tag, gs.Branch, gs.FrequencyPullFromGitMinutes)
+	gsClone.cloneDir = gs.cloneDir
 
-	// use only json files from relevant dirs
-	for _, path := range trees.TREE {
-		rawDataPath := "https://raw.githubusercontent.com/" + gsClone.Owner + "/" + gsClone.Repository + "/" + gsClone.Branch + "/" + path.PATH
-
-		if strings.HasPrefix(path.PATH, rulesJsonFileName+"/") && strings.HasSuffix(path.PATH, ".json") {
-			respStr, err := HttpGetter(gsClone.httpClient, rawDataPath)
-			if err != nil {
-				return err
-			}
-			if err := gsClone.setRulesWithRawRego(respStr, rawDataPath); err != nil {
-				zap.L().Debug("In setObjectsFromRepoOnce - failed to set rule %s\n", zap.String("path", rawDataPath))
-				return err
-			}
-		} else if strings.HasPrefix(path.PATH, controlsJsonFileName+"/") && strings.HasSuffix(path.PATH, ".json") {
-			respStr, err := HttpGetter(gs.httpClient, rawDataPath)
-			if err != nil {
-				return err
-			}
-			if err := gsClone.setControl(respStr); err != nil {
-				zap.L().Debug("In setObjectsFromRepoOnce - failed to set control %s\n", zap.String("path", rawDataPath))
-				return err
-			}
-		} else if strings.HasPrefix(path.PATH, frameworksJsonFileName+"/") && strings.HasSuffix(path.PATH, ".json") {
-			respStr, err := HttpGetter(gs.httpClient, rawDataPath)
-			if err != nil {
-				return err
-			}
-			if err := gsClone.setFramework(respStr); err != nil {
-				zap.L().Debug("In setObjectsFromRepoOnce - failed to set framework %s\n", zap.String("path", rawDataPath))
-				return err
-			}
-		} else if strings.HasPrefix(path.PATH, attackTracksPathPrefix+"/") && strings.HasSuffix(path.PATH, ".json") {
-			respStr, err := HttpGetter(gs.httpClient, rawDataPath)
-			if err != nil {
-				return nil
-			}
-			if err := gsClone.setAttackTrack(respStr); err != nil {
-				zap.L().Debug("In setObjectsFromRepoOnce - failed to set attack track %s\n", zap.String("path", rawDataPath))
-				return nil
-			}
-		} else if strings.HasPrefix(path.PATH, defaultConfigInputsFileName) && strings.HasSuffix(path.PATH, ".json") {
-			respStr, err := HttpGetter(gs.httpClient, rawDataPath)
-			if err != nil {
-				return err
-			}
-			if err := gsClone.setDefaultConfigInputs(respStr); err != nil {
-				zap.L().Debug("In setObjectsFromRepoOnce - failed to set DefaultConfigInputs %s\n", zap.String("path", rawDataPath))
-				return err
-			}
-		} else if strings.HasPrefix(path.PATH, systemPostureExceptionFileName+"/") && strings.HasSuffix(path.PATH, ".json") {
-			respStr, err := HttpGetter(gs.httpClient, rawDataPath)
-			if err != nil {
-				return err
-			}
-			if err := gsClone.setSystemPostureExceptionPolicy(respStr); err != nil {
-				zap.L().Debug("In setObjectsFromRepoOnce - failed to set setSystemPostureExceptionPolicy %s\n", zap.String("path", rawDataPath))
-				return err
-			}
-		} else if strings.HasSuffix(path.PATH, ControlRuleRelationsFileName+".csv") {
-			respStr, err := HttpGetter(gs.httpClient, rawDataPath)
-			if err != nil {
-				return err
-			}
-			gsClone.setControlRuleRelations(respStr)
-		} else if strings.HasSuffix(path.PATH, frameworkControlRelationsFileName+".csv") {
-			respStr, err := HttpGetter(gs.httpClient, rawDataPath)
-			if err != nil {
-				return err
-			}
-			gsClone.setFrameworkControlRelations(respStr)
+	// Set all the rego library objects
+	for objType, setFunc := range map[string]func() error{
+		"Rules":                     gsClone.setRulesFromLocalRepo,
+		"Controls":                  gsClone.setControlsFromLocalRepo,
+		"Frameworks":                gsClone.setFrameworksFromLocalRepo,
+		"AttackTracks":              gsClone.setAttackTracksFromLocalRepo,
+		"SystemExceptions":          gsClone.setSystemExceptionsFromLocalRepo,
+		"DefaultConfigInputs":       gsClone.setDefaultConfigInputsFromLocalRepo,
+		"ControlRuleRelations":      gsClone.setControlRuleRelationsFromLocalRepo,
+		"FrameworkControlRelations": gsClone.setFrameworkControlRelationsFromRepo,
+	} {
+		err = setFunc()
+		if err != nil {
+			return fmt.Errorf("setObjectsFromRepoOnce: failed to set %s: %w", objType, err)
 		}
 	}
 

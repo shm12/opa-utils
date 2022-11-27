@@ -19,6 +19,18 @@ require (
 )
 
 require (
+	github.com/Microsoft/go-winio v0.5.1 // indirect
+	github.com/emirpasic/gods v1.12.0 // indirect
+	github.com/go-git/gcfg v1.5.0 // indirect
+	github.com/go-git/go-billy/v5 v5.3.1 // indirect
+	github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 // indirect
+	github.com/kevinburke/ssh_config v0.0.0-20201106050909-4977a11b4351 // indirect
+	github.com/sergi/go-diff v1.1.0 // indirect
+	github.com/xanzy/ssh-agent v0.3.0 // indirect
+	gopkg.in/warnings.v0 v0.1.2 // indirect
+)
+
+require (
 	cloud.google.com/go/compute v1.7.0 // indirect
 	cloud.google.com/go/container v1.2.0 // indirect
 	github.com/Azure/azure-sdk-for-go v66.0.0+incompatible // indirect
@@ -57,6 +69,7 @@ require (
 	github.com/docker/go-units v0.4.0 // indirect
 	github.com/emicklei/go-restful v2.9.5+incompatible // indirect
 	github.com/ghodss/yaml v1.0.0 // indirect
+	github.com/go-git/go-git/v5 v5.3.0
 	github.com/go-logr/logr v1.2.3 // indirect
 	github.com/go-openapi/jsonpointer v0.19.5 // indirect
 	github.com/go-openapi/jsonreference v0.19.5 // indirect
